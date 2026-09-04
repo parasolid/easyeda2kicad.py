@@ -96,6 +96,65 @@ def _get_obj_bbox(
     )
 
 
+def compute_model_offset(model_3d: Ee3dModel) -> tuple[float, float, float]:
+    """Offset (mm) that repositions the raw model onto the KiCad footprint origin:
+    center XY on (0,0), put the bottom at z=0, then add the EasyEDA placement
+    metadata (c_origin - canvas_origin). Baked into the WRL vertices AND into the
+    STEP geometry so both land in the same place."""
+    offset_x = offset_y = offset_z = 0.0
+    bbox = _get_obj_bbox(model_3d.raw_obj) if model_3d.raw_obj else None
+    if bbox:
+        (x_min, x_max), (y_min, y_max), (z_min, _) = bbox
+        offset_x = -(x_min + x_max) / 2.0
+        offset_y = -(y_min + y_max) / 2.0
+        offset_z = -z_min
+    offset_x += model_3d.translation.x
+    offset_y += model_3d.translation.y
+    offset_z += model_3d.translation.z
+    return offset_x, offset_y, offset_z
+
+
+_STEP_NUMBER = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][-+]?\d+)?"
+_STEP_POINT_RE = re.compile(
+    r"(CARTESIAN_POINT\s*\(\s*'[^']*'\s*,\s*\(\s*)"
+    rf"({_STEP_NUMBER})(\s*,\s*)({_STEP_NUMBER})(\s*,\s*)({_STEP_NUMBER})"
+    r"(\s*\)\s*\))",
+    re.IGNORECASE,
+)
+
+
+def _format_step_number(value: float) -> str:
+    text = f"{value:.6f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    if text in ("", "-0", "0"):
+        return "0.0"
+    if "." not in text:
+        text += ".0"
+    return text
+
+
+def apply_step_offset(step: bytes, offset_x: float, offset_y: float, offset_z: float) -> bytes:
+    """Translate every 3D CARTESIAN_POINT in an ISO-10303-21 STEP file by the given
+    millimetre offset — the same offset generate_wrl_model bakes into the WRL, so the
+    STEP aligns to the KiCad footprint origin. Pure text rewrite (no CAD kernel needed);
+    EasyEDA STEP geometry is flat, so a one-shot translation of all points is exact."""
+    if (offset_x, offset_y, offset_z) == (0.0, 0.0, 0.0):
+        return step
+    offsets = (offset_x, offset_y, offset_z)
+
+    def repl(match: re.Match) -> str:
+        values = [float(match.group(i)) + offsets[k] for k, i in enumerate((2, 4, 6))]
+        return (
+            match.group(1)
+            + _format_step_number(values[0]) + match.group(3)
+            + _format_step_number(values[1]) + match.group(5)
+            + _format_step_number(values[2]) + match.group(7)
+        )
+
+    return _STEP_POINT_RE.sub(repl, step.decode("latin-1")).encode("latin-1")
+
+
 def generate_wrl_model(model_3d: Ee3dModel) -> Ki3dModel:
     if not model_3d.raw_obj:
         return Ki3dModel(
@@ -107,21 +166,9 @@ def generate_wrl_model(model_3d: Ee3dModel) -> Ki3dModel:
 
     materials = get_materials(obj_data=model_3d.raw_obj)
 
-    # Step 1: Center XY on (0,0); shift Z so bottom sits at z=0 (always).
-    # Step 2: Apply EE metadata offset (c_origin - canvas_origin) in mm.
-    # translate(-bbox_cx, -bbox_cy, -z_min) then apply EE offset,
-    # applied unconditionally for both SMD and THT.
-    offset_x, offset_y, offset_z = 0.0, 0.0, 0.0
-    bbox = _get_obj_bbox(model_3d.raw_obj)
-    if bbox:
-        (x_min, x_max), (y_min, y_max), (z_min, _) = bbox
-        offset_x = -(x_min + x_max) / 2.0
-        offset_y = -(y_min + y_max) / 2.0
-        offset_z = -z_min
-    # Add EE placement offset (already in mm, same unit as OBJ vertices)
-    offset_x += model_3d.translation.x
-    offset_y += model_3d.translation.y
-    offset_z += model_3d.translation.z
+    # Center XY on (0,0), bottom at z=0, then EE placement offset (see
+    # compute_model_offset). The identical offset is baked into the STEP on export.
+    offset_x, offset_y, offset_z = compute_model_offset(model_3d)
     logging.debug(
         f"3D centering offset: X={offset_x:.2f} Y={offset_y:.2f} Z={offset_z:.2f}"
     )
@@ -274,11 +321,15 @@ class Exporter3dModelKicad:
             wrl_path.write_text(self.output.raw_wrl, encoding="utf-8")
 
         if self.output_step:
-            # TODO: STEP is copied as-is without offset baking (unlike WRL).
-            # KiCad offset stays (0,0,0), so STEP is misplaced when
-            # model_3d.translation != (0,0,0) (i.e. c_origin != canvas_origin).
-            # Fix options: (a) write translation into .kicad_mod and remove WRL baking
-            # to avoid double-offset; (b) transform STEP geometry (needs opencascade).
-            step_path.write_bytes(self.output_step)
+            # Bake the same positioning offset into the STEP that generate_wrl_model
+            # bakes into the WRL, so both align to the footprint origin and the
+            # KiCad (model (offset)) can stay (0,0,0). Resolves the long-standing
+            # "STEP misplaced relative to WRL" mismatch without a CAD kernel.
+            step_bytes = self.output_step
+            if self.input is not None and self.input.raw_obj:
+                step_bytes = apply_step_offset(
+                    step_bytes, *compute_model_offset(self.input)
+                )
+            step_path.write_bytes(step_bytes)
 
         return True
