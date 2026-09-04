@@ -264,11 +264,19 @@ def _process_component(
                 + Path(f"{output}.3dshapes").relative_to(Path.cwd()).as_posix()
             )
         else:
-            model_3d_path = Path(f"{output}.3dshapes").as_posix()
+            # Store the model path prefixed with the literal ${LCSC} env var, which
+            # KiCad resolves at load time to the library root. Keeps the reference
+            # portable (e.g. ${LCSC}/jellybeans.3dshapes/NAME.step) instead of baking
+            # in an absolute path. Only the library folder name is appended.
+            model_3d_path = "${LCSC}/" + Path(f"{output}.3dshapes").name
         footprint_filename = f"{easyeda_footprint.info.name}.kicad_mod"
         ExporterFootprintKicad(footprint=easyeda_footprint).export(
             footprint_full_path=str(footprint_path / footprint_filename),
             model_3d_path=model_3d_path,
+            # Reference the STEP model by default: it is now correctly placed on the
+            # footprint origin (see export_kicad_3d_model.apply_step_offset) and, unlike
+            # the WRL, can be exported to MCAD / STEP board assemblies.
+            model_3d_extension="step",
         )
         logging.info(
             f"Created Kicad footprint for ID: {component_id}\n"

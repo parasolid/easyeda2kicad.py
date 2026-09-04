@@ -586,7 +586,7 @@ class ExporterFootprintKicad:
         self,
         footprint_full_path: str,
         model_3d_path: str,
-        model_3d_extension: str = "wrl",
+        model_3d_extension: str = "step",
     ) -> None:
         ki = self.output
         ki_lib = ""

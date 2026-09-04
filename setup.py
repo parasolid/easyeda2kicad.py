@@ -36,7 +36,12 @@ setup(
     package_dir={"easyeda2kicad": "easyeda2kicad"},
     entry_points={"console_scripts": ["easyeda2kicad = easyeda2kicad.__main__:main"]},
     python_requires=">=3.9",
-    install_requires=[],
+    install_requires=[
+        # OpenCASCADE (OCP) — used to rigidly translate downloaded STEP models onto
+        # the KiCad footprint origin. A CAD kernel is required: a raw-text point shift
+        # double-shifts B-rep geometry. See kicad/export_kicad_3d_model.py.
+        "cadquery-ocp>=7.7",
+    ],
     extras_require={
         "dev": [
             "pre-commit>=3.0.0",

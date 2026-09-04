@@ -6,6 +6,7 @@ from __future__ import annotations
 
 # Global imports
 import logging
+import os
 import re
 import textwrap
 from pathlib import Path
@@ -114,45 +115,105 @@ def compute_model_offset(model_3d: Ee3dModel) -> tuple[float, float, float]:
     return offset_x, offset_y, offset_z
 
 
-_STEP_NUMBER = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][-+]?\d+)?"
-_STEP_POINT_RE = re.compile(
-    r"(CARTESIAN_POINT\s*\(\s*'[^']*'\s*,\s*\(\s*)"
-    rf"({_STEP_NUMBER})(\s*,\s*)({_STEP_NUMBER})(\s*,\s*)({_STEP_NUMBER})"
-    r"(\s*\)\s*\))",
-    re.IGNORECASE,
-)
+def _translate_step_bytes(step: bytes, dx: float, dy: float, dz: float) -> bytes:
+    """Rigidly translate a STEP solid by (dx, dy, dz) mm using the OpenCASCADE kernel,
+    preserving colours and names.
 
+    Reads the STEP through the XDE/XCAF framework (so presentation attributes survive
+    the round-trip), then places the part as the single component of a wrapper assembly
+    whose component location carries the translation. The part's own frame — and thus
+    its per-face STYLED_ITEM colour links — is left untouched.
 
-def _format_step_number(value: float) -> str:
-    text = f"{value:.6f}"
-    if "." in text:
-        text = text.rstrip("0").rstrip(".")
-    if text in ("", "-0", "0"):
-        return "0.0"
-    if "." not in text:
-        text += ".0"
-    return text
+    Two wrong approaches this avoids:
+      * a raw-text CARTESIAN_POINT rewrite shifts both the geometry vertices AND the
+        placement/axis points they live in, double-shifting B-rep models (the old
+        "STEP floats" bug);
+      * a geometry rebuild or bulk subshape move (BRepBuilderAPI_Transform / Shape.Moved)
+        re-keys every subshape, so the colour tool can no longer match them and the
+        model comes out grey.
+    """
+    import tempfile
+
+    from OCP.gp import gp_Trsf, gp_Vec
+    from OCP.IFSelect import IFSelect_RetDone
+    from OCP.Message import Message, Message_Gravity
+    from OCP.STEPCAFControl import STEPCAFControl_Reader, STEPCAFControl_Writer
+    from OCP.STEPControl import STEPControl_StepModelType
+    from OCP.TCollection import TCollection_ExtendedString
+    from OCP.TDF import TDF_LabelSequence
+    from OCP.TDocStd import TDocStd_Document
+    from OCP.TopLoc import TopLoc_Location
+    from OCP.XCAFApp import XCAFApp_Application
+    from OCP.XCAFDoc import XCAFDoc_DocumentTool
+
+    # Keep the kernel quiet — the reader/writer otherwise dump statistics to stdout.
+    printers = Message.DefaultMessenger_s().Printers()
+    for i in range(printers.Length()):
+        printers.Value(i + 1).SetTraceLevel(Message_Gravity.Message_Fail)
+
+    in_path = out_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".step", delete=False) as tmp_in:
+            tmp_in.write(step)
+            in_path = tmp_in.name
+
+        app = XCAFApp_Application.GetApplication_s()
+        doc = TDocStd_Document(TCollection_ExtendedString("BinXCAF"))
+        app.InitDocument(doc)
+
+        reader = STEPCAFControl_Reader()
+        reader.SetColorMode(True)
+        reader.SetNameMode(True)
+        reader.SetLayerMode(True)
+        if reader.ReadFile(in_path) != IFSelect_RetDone:
+            raise RuntimeError("STEP read failed")
+        reader.Transfer(doc)
+
+        shape_tool = XCAFDoc_DocumentTool.ShapeTool_s(doc.Main())
+        free_shapes = TDF_LabelSequence()
+        shape_tool.GetFreeShapes(free_shapes)
+
+        trsf = gp_Trsf()
+        trsf.SetTranslation(gp_Vec(dx, dy, dz))
+        location = TopLoc_Location(trsf)
+
+        # Wrap the coloured part(s) in an assembly and carry the offset as the component
+        # location, so the part's frame (and its colour links) stays intact while the
+        # instance lands on the KiCad footprint origin.
+        assembly = shape_tool.NewShape()
+        for i in range(1, free_shapes.Length() + 1):
+            shape_tool.AddComponent(assembly, free_shapes.Value(i), location)
+        shape_tool.UpdateAssemblies()
+
+        out_path = in_path + ".out.step"
+        writer = STEPCAFControl_Writer()
+        writer.SetColorMode(True)
+        writer.SetNameMode(True)
+        writer.Transfer(doc, STEPControl_StepModelType.STEPControl_AsIs)
+        if writer.Write(out_path) != IFSelect_RetDone:
+            raise RuntimeError("STEP write failed")
+        with open(out_path, "rb") as fh:
+            return fh.read()
+    finally:
+        for path in (in_path, out_path):
+            if path and os.path.exists(path):
+                os.remove(path)
 
 
 def apply_step_offset(step: bytes, offset_x: float, offset_y: float, offset_z: float) -> bytes:
-    """Translate every 3D CARTESIAN_POINT in an ISO-10303-21 STEP file by the given
-    millimetre offset — the same offset generate_wrl_model bakes into the WRL, so the
-    STEP aligns to the KiCad footprint origin. Pure text rewrite (no CAD kernel needed);
-    EasyEDA STEP geometry is flat, so a one-shot translation of all points is exact."""
+    """Translate the STEP solid by the given millimetre offset — the same offset
+    generate_wrl_model bakes into the WRL — so both land on the KiCad footprint origin.
+    One exact rigid transform via the CAD kernel; see _translate_step_bytes."""
     if (offset_x, offset_y, offset_z) == (0.0, 0.0, 0.0):
         return step
-    offsets = (offset_x, offset_y, offset_z)
-
-    def repl(match: re.Match) -> str:
-        values = [float(match.group(i)) + offsets[k] for k, i in enumerate((2, 4, 6))]
-        return (
-            match.group(1)
-            + _format_step_number(values[0]) + match.group(3)
-            + _format_step_number(values[1]) + match.group(5)
-            + _format_step_number(values[2]) + match.group(7)
+    try:
+        return _translate_step_bytes(step, offset_x, offset_y, offset_z)
+    except Exception as exc:  # noqa: BLE001 — never lose the model over a transform hiccup
+        logging.error(
+            f"STEP offset via CAD kernel failed ({exc}); writing the STEP un-offset. "
+            "It may be mis-aligned relative to the KiCad footprint origin."
         )
-
-    return _STEP_POINT_RE.sub(repl, step.decode("latin-1")).encode("latin-1")
+        return step
 
 
 def generate_wrl_model(model_3d: Ee3dModel) -> Ki3dModel:
